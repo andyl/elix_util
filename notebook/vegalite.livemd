@@ -57,7 +57,7 @@ data = [
   %{"a" => "I", "b" => 52}
 ]
 
-Vl.new(width: 400, height: 300)
+Vl.new(width: 400, height: 400)
 |> Vl.data_from_values(data)
 |> Vl.mark(:bar)
 |> Vl.encode_field(:x, "a", type: :nominal, axis: [label_angle: 0])
