@@ -1,0 +1,407 @@
+#!/usr/bin/env elixir
+
+Mix.install([:ratatouille])
+
+defmodule ReorderMigrations do
+  @behaviour Ratatouille.App
+  alias Ratatouille.Runtime.Command
+  import Ratatouille.View
+  import Ratatouille.Constants, only: [key: 1]
+
+  @enter key(:enter)
+  @arrow_up key(:arrow_up)
+  @arrow_down key(:arrow_down)
+  @spacebar key(:space)
+
+  def init(%{window: window}) do
+    # {[path: path], []} = OptionParser.parse!(System.argv(), strict: [path: :string])
+    
+    path = "."
+
+    # 7 -this number is based on a number of nested widgets. it is easier to adjust the value empirically
+    content_size = window.height - 7
+
+    model = %{
+      files_content_offset: 0,
+      content_size: content_size,
+      path: path,
+      files: [],
+      files_to_render: [],
+      debug: nil,
+      mode: :loading,
+      selected_files: [],
+      edited_by_mapping: %{},
+      moving_mapping: %{},
+      content_under_files_cursor: nil,
+      files_cursor: nil
+    }
+
+    {model, scan_directory_cmd(model)}
+  end
+
+  defp files_to_render(files, offset, size) do
+    files
+    |> Enum.with_index()
+    |> Enum.filter(fn {_file_name, idx} -> idx >= offset and idx < offset + size end)
+  end
+
+  defp inc_timestamp_by(file_name, increment) do
+    {timestamp, rest} = Integer.parse(file_name)
+    "#{timestamp + increment}#{rest}"
+  end
+
+  @scroll_offset 5
+  def update(model, msg) do
+    case {msg, model.mode} do
+      {{:edited_by_updated, edited_by_mapping}, _} ->
+        model = %{model | edited_by_mapping: Map.merge(model.edited_by_mapping, edited_by_mapping)}
+        {model, update_content_cmd(model)}
+
+      {{:directory_scanned, files}, :loading} ->
+        files_cursor =
+          case files do
+            [] -> nil
+            _ -> 0
+          end
+
+        # reset files_content_offset and use it instead of 0?
+        model = %{
+          model
+          | files_cursor: files_cursor,
+            mode: :select_files,
+            files: files,
+            files_to_render: files_to_render(files, 0, model.content_size)
+        }
+
+        case files_cursor do
+          nil -> model
+          _cursor -> {model, update_edited_by_cmd(model)}
+        end
+
+      {{:files_moved, :ok}, :move_files} ->
+        model = %{
+          model
+          | moving_mapping: %{},
+            mode: :loading,
+            selected_files: []
+        }
+
+        {model, scan_directory_cmd(model)}
+
+      {{:event, %{key: @enter}}, :move_files} ->
+        {model, move_files_cmd(model)}
+
+      {{:event, %{key: @spacebar}}, :select_files} ->
+        new_selected_files =
+          if model.files_cursor in model.selected_files do
+            model.selected_files -- [model.files_cursor]
+          else
+            [model.files_cursor | model.selected_files]
+          end
+
+        %{
+          model
+          | selected_files: new_selected_files,
+            moving_mapping:
+              Map.take(
+                model.moving_mapping,
+                Enum.map(new_selected_files, &Enum.at(model.files, &1))
+              )
+        }
+
+      {{:event, %{key: key}}, :move_files} when key in [@arrow_up, @arrow_down] ->
+        closest_distance =
+          model.files
+          |> Enum.map(fn file_name ->
+            case Map.get(model.moving_mapping, file_name) do
+              nil -> {:original, file_name}
+              file_name -> {:renamed, file_name}
+            end
+          end)
+          |> Enum.sort_by(
+            &elem(&1, 1),
+            case key do
+              @arrow_up -> :desc
+              @arrow_down -> :asc
+            end
+          )
+          |> Enum.reduce_while(nil, fn
+            {:renamed, file_name2}, {:original, file_name1} ->
+              {timestamp1, _} = Integer.parse(file_name1)
+              {timestamp2, _} = Integer.parse(file_name2)
+              {:halt, timestamp1 - timestamp2}
+
+            {:renamed, _}, nil ->
+              {:cont, nil}
+
+            {:original, _} = el, _acc ->
+              {:cont, el}
+          end)
+          |> case do
+            value when is_integer(value) -> value
+            _ -> 0
+          end
+
+        step =
+          case key do
+            @arrow_up -> closest_distance + 1
+            @arrow_down -> closest_distance - 1
+          end
+
+        new_moving_mapping =
+          model.moving_mapping
+          |> Map.new(fn {from, to} ->
+            {from, inc_timestamp_by(to, step)}
+          end)
+
+        new_files_to_render =
+          model.files
+          |> Enum.map(&(new_moving_mapping[&1] || &1))
+          |> Enum.sort(:desc)
+          |> files_to_render(model.files_content_offset, model.content_size)
+
+        %{model | moving_mapping: new_moving_mapping, files_to_render: new_files_to_render, debug: closest_distance}
+
+      {{:event, %{key: key}}, :select_files} when key in [@arrow_up, @arrow_down] ->
+        new_cursor =
+          case key do
+            @arrow_up -> max(model.files_cursor - 1, 0)
+            @arrow_down -> min(model.files_cursor + 1, length(model.files) - 1)
+          end
+
+        shift_offset =
+          cond do
+            new_cursor - model.content_size + @scroll_offset - model.files_content_offset == 1 -> 1
+            model.files_content_offset > 0 and new_cursor - model.files_content_offset == 1 -> -1
+            true -> 0
+          end
+
+        new_files_content_offset = model.files_content_offset + shift_offset
+
+        new_model = %{
+          model
+          | files_cursor: new_cursor,
+            files_content_offset: new_files_content_offset,
+            files_to_render: files_to_render(model.files, new_files_content_offset, model.content_size)
+        }
+
+        {new_model, update_edited_by_cmd(new_model)}
+
+      {{:event, %{ch: ?m}}, :move_files} ->
+        %{
+          model
+          | mode: :select_files,
+            files_to_render: files_to_render(model.files, model.files_content_offset, model.content_size)
+        }
+
+      {{:event, %{ch: ?m}}, :select_files} ->
+        new_moving_mapping =
+          model.files
+          |> Enum.with_index()
+          |> Enum.flat_map(fn {file_name, idx} ->
+            if idx in model.selected_files do
+              [file_name]
+            else
+              []
+            end
+          end)
+          |> Map.new(&{&1, &1})
+          |> Map.merge(model.moving_mapping)
+
+        new_files_to_render =
+          model.files
+          |> Enum.map(&(new_moving_mapping[&1] || &1))
+          |> Enum.sort(:desc)
+          |> files_to_render(model.files_content_offset, model.content_size)
+
+        %{model | mode: :move_files, moving_mapping: new_moving_mapping, files_to_render: new_files_to_render}
+
+      {{:content_updated, content}, :select_files} ->
+        %{model | content_under_files_cursor: content}
+
+      _ ->
+        model |> Map.put(:debug, msg)
+    end
+  end
+
+  def render(model) do
+    view do
+      panel title: "Reorder migrations", height: :fill do
+        row do
+          column(size: 6) do
+            case model.mode do
+              :loading -> label(content: "MODE: LOADING", color: :magenta)
+              :select_files -> label(content: "MODE: SELECT FILES", color: :blue)
+              :move_files -> label(content: "MODE: MOVE FILES", color: :yellow)
+            end
+
+            panel title: model.path, height: :fill do
+              table do
+                for {file_name, idx} <- model.files_to_render do
+                  case model.mode do
+                    :loading ->
+                      []
+
+                    :select_files ->
+                      table_row(selected_row_styles(selected?: idx == model.files_cursor)) do
+                        selected_cell(selected?: idx in model.selected_files)
+                        table_cell(content: file_name)
+
+                        edited_by_cell(model.edited_by_mapping, file_name)
+                      end
+
+                    :move_files ->
+                      table_row(selected_row_styles(selected?: file_name in Map.values(model.moving_mapping))) do
+                        selected_cell(selected?: file_name in Map.values(model.moving_mapping))
+                        table_cell(content: file_name)
+                        table_cell(content: model.edited_by_mapping[file_name])
+                      end
+                  end
+                end
+              end
+            end
+          end
+
+          column(size: 6) do
+            # panel title: "debug", height: 30 do
+            #   viewport do
+            #     label(
+            #       content:
+            #         inspect(
+            #           Map.take(model, [
+            #             :debug,
+            #             :edited_by_mapping,
+            #             :moving_mapping,
+            #             :files_cursor,
+            #             :files_content_offset
+            #           ]),
+            #           pretty: true,
+            #           width: 50
+            #         )
+            #     )
+            #   end
+            # end
+
+            label(content: "CONTENT", color: :magenta)
+
+            panel title:
+                    (case model.files_cursor do
+                       nil -> nil
+                       files_cursor -> Enum.at(model.files, files_cursor)
+                     end),
+                  height: :fill do
+              viewport do
+                if is_nil(model.content_under_files_cursor) do
+                  label(content: "No selected file")
+                else
+                  label(content: slice_by_lines(model.content_under_files_cursor, 0, model.content_size))
+                end
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+
+  defp selected_row_styles(selected?: selected?) do
+    if selected? do
+      [
+        color: :black,
+        background: :white
+      ]
+    else
+      []
+    end
+  end
+
+  defp edited_by_cell(mapping, file_name) do
+    case Map.fetch(mapping, file_name) do
+      {:ok, nil} -> table_cell(content: "?", color: :red)
+      {:ok, edited_by} -> table_cell(content: edited_by)
+      :error -> table_cell(content: "...", color: :yellow)
+    end
+  end
+
+  defp selected_cell(selected?: selected?) do
+    table_cell(
+      content:
+        if selected? do
+          " ✔️"
+        else
+          "  "
+        end,
+      color: :yellow
+    )
+  end
+
+  defp slice_by_lines(content, from, to) do
+    content
+    |> String.split("\n")
+    |> Enum.slice(from, to)
+    |> Enum.join("\n")
+  end
+
+  defp scan_directory_cmd(model) do
+    Command.new(fn -> scan_directory(model) end, :directory_scanned)
+  end
+
+  defp update_content_cmd(model) do
+    Command.new(fn -> read_content(model) end, :content_updated)
+  end
+
+  defp move_files_cmd(model) do
+    Command.new(fn -> move_files(model) end, :files_moved)
+  end
+
+  defp update_edited_by_cmd(model) do
+    Command.new(fn -> read_edited_by(model) end, :edited_by_updated)
+  end
+
+  defp move_files(model) do
+    model.moving_mapping
+    |> Enum.each(fn {from, to} ->
+      File.rename(Path.join(model.path, from), Path.join(model.path, to))
+    end)
+  end
+
+  defp scan_directory(%{path: path}) do
+    path
+    |> File.ls!()
+    |> Enum.sort(:desc)
+  end
+
+  defp read_edited_by(%{path: path, files_to_render: files_to_render, edited_by_mapping: edited_by_mapping}) do
+    (Enum.map(files_to_render, &elem(&1, 0)) -- Map.keys(edited_by_mapping))
+    |> Map.new(fn file_name ->
+      author =
+        :os.cmd(
+          """
+          git blame #{Path.join(path, file_name)} --porcelain | grep  "^author " -m 1
+          """
+          |> String.to_charlist()
+        )
+        |> to_string()
+        |> case do
+          "author " <> author_name -> String.trim_trailing(author_name)
+          _ -> nil
+        end
+
+      {file_name, author}
+    end)
+  end
+
+  defp read_content(%{files_cursor: files_cursor, path: path, files: files}) do
+    file_name = Enum.at(files, files_cursor)
+
+    path
+    |> Path.join(file_name)
+    |> File.read()
+    |> case do
+      {:ok, content} -> content
+      _ -> nil
+    end
+  end
+end
+
+Ratatouille.run(ReorderMigrations)
